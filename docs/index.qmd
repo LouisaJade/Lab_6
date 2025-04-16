@@ -38,7 +38,7 @@ types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
 
 remote_files  <- glue('{root}/camels_{types}.txt')
 
-local_files   <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('{root} /camels_{types}.txt')
 
 
 walk2(remote_files, local_files, download.file, quiet = TRUE)

@@ -1,0 +1,395 @@
+---
+project:
+  title: "Lab_8"
+  output-dir: docs
+  type: website
+format:
+  html:
+    self-contained: true
+---
+
+##Setup/Data
+```{r}
+library(tidyverse)
+library(powerjoin)
+library(glue)
+```
+
+```{r}
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+```
+
+```{r}
+root <- 'https://gdex.ucar.edu/dataset/camels/file'
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+```
+
+```{r}
+remote_files <- glue('{root}/camels_{types}.txt')
+local_files  <- glue('data/camels_{types}.txt')
+```
+
+```{r}
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels_list <- map(local_files, read_delim, show_col_types = FALSE)
+
+camels <- power_full_join(camels_list, by = "gauge_id")
+
+glimpse(camels)
+```
+
+```{r}
+library(skimr)
+library(visdat)
+library(ggpubr)
+
+skim(camels)
+```
+
+```{r}
+vis_miss(camels) 
+```
+
+```{r}
+library(GGally)
+
+camels_clean <- camels %>%
+  filter(complete.cases(select(., aridity, p_mean, q_mean))) %>%
+  select(aridity, p_mean, q_mean, gauge_lat, gauge_lon)
+
+ggpairs(
+  camels_clean %>% select(aridity, p_mean, q_mean),
+  title = "Pairwise Plot of Core Hydrologic Variables"
+)
+```
+
+##Data Splitting
+```{r}
+library(rsample)
+
+set.seed(123)
+```
+
+```{r}
+camels_split <- initial_split(camels_clean, prop = 0.8)
+camels_train <- training(camels_split)
+
+camels_test  <- testing(camels_split)
+```
+
+```{r}
+dim(camels_train)
+dim(camels_test)
+```
+
+##Feature Engineering
+```{r}
+library(recipes)
+```
+
+
+```{r}
+camels_recipe <- recipe(q_mean ~ aridity + p_mean, data = camels_train) %>%
+  step_log(all_numeric_predictors(), base = 10) %>%
+  step_naomit(all_predictors(), all_outcomes())
+
+camels_recipe
+
+summary(camels_train)
+```
+##1 Resample
+```{r}
+library(rsample)
+
+camels_cv <- vfold_cv(camels_train, v = 10, strata = "q_mean")
+
+camels_cv
+```
+
+##2 Models
+```{r}
+library(parsnip)
+library(ranger)
+library(xgboost)
+```
+
+```{r}
+linear_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+rf_model <- rand_forest(mtry = 2, trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+boosted_model <- boost_tree(trees = 1000, tree_depth = 6, min_n = 10) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+##3 test models
+```{r}
+library(workflows)
+library(workflowsets)
+library(tune)     # Needed for resampling and metrics
+library(yardstick)
+```
+
+```{r}
+model_workflows <- workflow_set(
+  preproc = list(camels_recipe),
+  models = list(
+    linear = linear_model,
+    random_forest = rf_model,
+    xgboost = boosted_model
+  )
+)
+```
+
+```{r}
+model_results <- model_workflows %>%
+  workflow_map("fit_resamples", resamples = camels_cv)
+```
+
+##selection
+```{r}
+autoplot(model_results)
+
+collect_metrics(model_results)
+```
+```{r}
+#The random forest model performed the best, with the lowest rmse (0.50) and the highest rsq (0.89), indicating strong predictive accuracy and variance explanation. It outperformed both the linear model and boosted tree, making it the best choice for predicting `q_mean`. Random forests are well-suited for capturing complex, nonlinear relationships in the data, which likely contributed to its strong performance.
+
+#I chose the random forest model because this type of model builds many decision trees and then averages their results. It uses the "ranger" engine and works in regression mode. This model is probably doing well because it can find complex patterns and relationships between things like `aridity` and `p_mean`, which are important for predicting streamflow (`q_mean`). It’s also good at handling messy data and doesn’t overfit easily, which makes it a good fit for this kind of hydrologic data.
+```
+
+##Tuning
+#1
+```{r}
+library(parsnip)
+library(ranger)
+
+rf_model_tune <- rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+```
+
+```{r}
+library(tune)
+library(dials)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, 5)),
+  min_n(range = c(2, 10)),
+  levels = 5
+)
+
+rf_grid
+```
+
+```{r}
+library(workflows)
+library(rsample)
+
+rf_workflow <- workflow() %>%
+  add_recipe(camels_recipe) %>%
+  add_model(rf_model_tune)
+
+rf_tune_results <- rf_workflow %>%
+  tune_grid(
+    resamples = camels_cv,
+    grid = rf_grid
+  )
+
+autoplot(rf_tune_results)
+
+collect_metrics(rf_tune_results)
+```
+
+#2
+```{r}
+library(workflows)
+
+rf_workflow <- workflow() %>%
+  add_recipe(camels_recipe) %>%
+  add_model(rf_model_tune)
+
+rf_workflow
+```
+
+#3
+```{r}
+library(tune)
+
+dials <- extract_parameter_set_dials(rf_workflow)
+
+dials <- update(dials, mtry = mtry(range = c(1, 10)))
+
+dials <- update(dials, min_n = min_n(range = c(2, 15)))
+
+my_grid <- grid_space_filling(dials, size = 25)
+
+dials
+
+```
+
+```{r}
+dials <- extract_parameter_set_dials(rf_workflow)
+
+dials
+```
+
+```{r}
+dials$object
+```
+#4
+```{r}
+library(dials)
+
+dials <- extract_parameter_set_dials(rf_workflow)
+
+dials <- finalize(dials, camels_train)
+
+my.grid <- grid_space_filling(dials, size = 25)
+
+my.grid
+```
+
+#5
+```{r}
+library(tune)
+library(yardstick)
+
+model_params <- tune_grid(
+  rf_workflow,
+  resamples = camels_cv,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+autoplot(model_params)
+```
+
+```{r}
+#It looks like mae and rmse are very similar both with the randomly selected predictors and minimal node size. This means that the model's prediction errors were fairly consistent, with no big outliers. Since RMSE gives more weight to larger errors but still showed similar results to MAE, it suggests that the model didn't have any extreme errors. 
+```
+
+#6
+```{r}
+model_params %>%
+  collect_metrics()
+```
+
+```{r}
+model_params %>%
+  show_best(metric = "mae")
+```
+```{r}
+#The first row shows that the best performing model has mtry = 19 and min_n = 10. This means the model used 19 randomly selected predictors and needed 10 data points to split a node. The average mae is 0.3164, meaning the model's predictions are off by ~0.32 on average, which is low and means the model is a good performer. The standard error (0.0184) is small, indicating the model is consistent across different tests.
+```
+
+
+```{r}
+hp_best <- select_best(model_params, metric = "mae")
+```
+
+#7
+```{r}
+final_workflow <- finalize_workflow(rf_workflow, hp_best)
+
+print(final_workflow)
+```
+
+##Final Model Verification
+```{r}
+final_fit <- last_fit(final_workflow, camels_split)
+
+final_metrics <- collect_metrics(final_fit)
+final_metrics
+```
+
+```{r}
+#The results show that the final model has an rmse of 0.463 and an rsq of 0.891. The low rmse indicates that the model's predictions are relatively close to the actual values, while the high rsq suggests that the model explains 89.15% of the variability in the test data. These are strong results, indicating that the model performs well.
+```
+
+
+```{r}
+final_predictions <- collect_predictions(final_fit)
+final_predictions
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(final_predictions, aes(x = .pred, y = q_mean)) +
+  geom_point(aes(color = "pink"), alpha = 0.6) +
+  geom_smooth(method = "lm", color = "darkblue", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("pink")) +
+  labs(
+    title = "Predicted vs Actual Values",
+    x = "Predicted Streamflow (q_mean)",
+    y = "Actual Streamflow (q_mean)",
+    caption = "Red line: Linear fit, Dashed line: 1:1 line"
+  ) +
+  theme_minimal()
+```
+
+##Building a map
+```{r}
+final_model <- fit(final_workflow, data = camels_clean)
+```
+
+```{r}
+predictions <- augment(final_model, camels_clean)
+
+predictions <- predictions %>%
+  mutate(residuals = .pred - q_mean)
+
+head(predictions)
+```
+#Map of predicted
+```{r}
+library(ggplot2)
+library(ggpubr)
+
+pred_map <- ggplot(predictions, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(alpha = 0.6) +
+  scale_color_viridis_c(option = "C") +  # Define color palette
+  labs(title = "Predicted Streamflow (q_mean)", color = "Predicted Value") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(pred_map)
+```
+
+#map of residual
+```{r}
+resid_map <- ggplot(predictions, aes(x = gauge_lon, y = gauge_lat, color = residuals)) +
+  geom_point(alpha = 0.6) +
+  scale_color_viridis_c(option = "C") +  # Define color palette
+  labs(title = "Residuals of Predictions (Predicted - Actual)", color = "Residuals") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(resid_map)
+```
+
+#combined maps
+```{r}
+library(patchwork)
+
+combined_map <- pred_map + resid_map +
+  plot_layout(ncol = 2, heights = c(6, 6))
+
+print(combined_map)
+```
+
